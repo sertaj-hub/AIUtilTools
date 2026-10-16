@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "servicenow": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "servicenow_mcp.server"],
+      "env": {
+        "SN_AUTH_MODE": "mock"
+      }
+    }
+  }
+}
