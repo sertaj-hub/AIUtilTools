@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "sharepoint-policy": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "sharepoint_policy_mcp.server"],
+      "env": {
+        "SP_AUTH_MODE": "mock"
+      }
+    }
+  }
+}
