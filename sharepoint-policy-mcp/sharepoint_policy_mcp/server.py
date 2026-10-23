@@ -219,7 +219,7 @@ async def sp_search_policy(
         "count": len(hits),
         "limit": capped,
         "truncated": len(hits) == capped,
-        "retrieval": "lexical (BM25)",
+        "retrieval": settings.retrieval,
         "results": [_hit_payload(h, settings) for h in hits],
     }
     if withheld:

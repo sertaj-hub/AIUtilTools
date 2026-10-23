@@ -27,6 +27,12 @@ DEFAULT_USER_GROUPS = ("aml-analyst",)
 
 AUTH_MODES = ("mock", "graph")
 
+# Lexical is the default even now that the dense half exists, because the only
+# embedder in the tree is a lexical test rig. Fusing it with BM25 adds a second
+# opinion from the same evidence, which is not what hybrid retrieval is for.
+# Flip this to "hybrid" once a real embedder is configured.
+RETRIEVAL_MODES = ("lexical", "hybrid")
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment is missing or contradicts itself."""
@@ -97,6 +103,8 @@ class Settings:
     client_secret: str | None = None
     allowed_libraries: tuple[str, ...] = DEFAULT_ALLOWED_LIBRARIES
     user_groups: tuple[str, ...] = DEFAULT_USER_GROUPS
+    retrieval: str = "lexical"
+    embedding_dimensions: int = 512
     max_limit: int = 10
     default_limit: int = 5
     max_passage_chars: int = 1200
@@ -107,6 +115,10 @@ class Settings:
     @property
     def is_mock(self) -> bool:
         return self.auth_mode == "mock"
+
+    @property
+    def is_hybrid(self) -> bool:
+        return self.retrieval == "hybrid"
 
     def library_allowed(self, library: str) -> bool:
         return library.strip().lower() in {lib.lower() for lib in self.allowed_libraries}
@@ -163,6 +175,17 @@ class Settings:
             raise ConfigError("SP_MAX_LIMIT must be at least 1")
         default_limit = _env_int("SP_DEFAULT_LIMIT", 5)
 
+        retrieval = (os.environ.get("SP_RETRIEVAL") or "lexical").strip().lower()
+        if retrieval not in RETRIEVAL_MODES:
+            raise ConfigError(
+                f"SP_RETRIEVAL must be one of {', '.join(RETRIEVAL_MODES)}, "
+                f"got {retrieval!r}"
+            )
+
+        embedding_dimensions = _env_int("SP_EMBEDDING_DIMENSIONS", 512)
+        if embedding_dimensions < 16:
+            raise ConfigError("SP_EMBEDDING_DIMENSIONS must be at least 16")
+
         max_passage_chars = _env_int("SP_MAX_PASSAGE_CHARS", 1200)
         if max_passage_chars < 200:
             raise ConfigError("SP_MAX_PASSAGE_CHARS must be at least 200")
@@ -175,6 +198,8 @@ class Settings:
             client_secret=client_secret,
             allowed_libraries=_env_tuple("SP_ALLOWED_LIBRARIES", DEFAULT_ALLOWED_LIBRARIES),
             user_groups=_env_tuple("SP_USER_GROUPS", DEFAULT_USER_GROUPS),
+            retrieval=retrieval,
+            embedding_dimensions=embedding_dimensions,
             max_limit=max_limit,
             default_limit=max(1, min(default_limit, max_limit)),
             max_passage_chars=max_passage_chars,

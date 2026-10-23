@@ -12,8 +12,11 @@ from typing import Any, Protocol
 
 from .config import ConfigError, Settings
 from .corpus import DOCUMENTS, documents_by_key, pairs, version_of
+from .embedder import Embedder, HashingEmbedder
+from .hybrid import rank_ids, reciprocal_rank_fusion
 from .models import Document, Hit, Section
 from .search import PolicyIndex
+from .vectors import VectorIndex
 
 
 class PolicyStoreError(RuntimeError):
@@ -65,10 +68,31 @@ class MockPolicyStore:
     ever seen fail.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, embedder: Embedder | None = None) -> None:
         self._settings = settings
-        self._index = PolicyIndex(pairs())
+        self._pairs = pairs()
+        self._index = PolicyIndex(self._pairs)
         self._by_key = documents_by_key()
+        self._by_id = {section.section_id: (section, doc) for section, doc in self._pairs}
+        self._embedder = embedder or HashingEmbedder(settings.embedding_dimensions)
+        self._vectors: VectorIndex | None = None
+
+    async def _ensure_vectors(self) -> VectorIndex:
+        """Embed the corpus on first hybrid search, not at construction.
+
+        Importing this module must stay free of work: the server builds its
+        backend lazily so that `claude mcp list` does not pay for an index it
+        may never query.
+        """
+        if self._vectors is None:
+            texts = [section.text for section, _ in self._pairs]
+            matrix = await self._embedder.embed_documents(texts)
+            self._vectors = VectorIndex(
+                [section.section_id for section, _ in self._pairs],
+                matrix,
+                self._embedder.name,
+            )
+        return self._vectors
 
     # -- guardrails ------------------------------------------------------
 
@@ -95,7 +119,14 @@ class MockPolicyStore:
             "documents_indexed": len(DOCUMENTS),
             "documents_visible": len(visible),
             "sections_indexed": len(self._index),
-            "retrieval": "lexical (BM25); vector half not yet built",
+            "retrieval": self._settings.retrieval,
+            "retrieval_detail": (
+                f"BM25 fused with {self._embedder.name} by reciprocal rank"
+                if self._settings.is_hybrid
+                else "BM25 only; set SP_RETRIEVAL=hybrid to fuse in embeddings"
+            ),
+            "embedder": self._embedder.name,
+            "embedder_is_semantic": self._embedder.is_semantic,
             "corpus": "SYNTHETIC -- illustrative policy text, not your institution's",
         }
 
@@ -129,6 +160,8 @@ class MockPolicyStore:
         # see. Readable hits below the cut line are promoted to backfill the
         # page.
         ranked = self._index.search(query, where=admits, limit=None)
+        if self._settings.is_hybrid:
+            ranked = await self._fuse(query, ranked, admits)
         readable = [h for h in ranked if self._section_visible(h.section, h.document)]
 
         # `withheld` counts only unreadable sections that would have appeared
@@ -144,6 +177,59 @@ class MockPolicyStore:
             if not self._section_visible(hit.section, hit.document)
         )
         return readable[:limit], withheld
+
+    async def _fuse(
+        self,
+        query: str,
+        lexical: list[Hit],
+        admits,
+    ) -> list[Hit]:
+        """Combine the lexical ranking with the dense one by rank, not score.
+
+        The dense side can surface a section the lexical side scored at zero,
+        so the fused list is rebuilt from ids rather than reordered in place.
+        Scores from the two retrievers are never added -- see hybrid.py.
+        """
+        vectors = await self._ensure_vectors()
+        query_vector = await self._embedder.embed_query(query)
+
+        dense: list[str] = []
+        for section_id in rank_ids(vectors.search(query_vector)):
+            found = self._by_id.get(section_id)
+            # The hard filters (doc_type, policy_id, superseded) are applied
+            # to the dense side too; entitlement is still handled after
+            # fusion, so `withheld` keeps counting the page it would have.
+            if found is not None and admits(found[0], found[1]):
+                dense.append(section_id)
+
+        lexical_by_id = {hit.section.section_id: hit for hit in lexical}
+        fused = reciprocal_rank_fusion(
+            {"lexical": [h.section.section_id for h in lexical], "dense": dense}
+        )
+
+        out: list[Hit] = []
+        for entry in fused:
+            prior = lexical_by_id.get(entry.doc_id)
+            if prior is not None:
+                out.append(
+                    Hit(
+                        section=prior.section,
+                        document=prior.document,
+                        score=entry.score,
+                        matched_terms=prior.matched_terms,
+                    )
+                )
+                continue
+            found = self._by_id.get(entry.doc_id)
+            if found is None:
+                continue
+            section, document = found
+            # Retrieved on the dense side alone: no lexical terms matched, and
+            # saying so is more useful than an empty tuple that looks like a bug.
+            out.append(
+                Hit(section=section, document=document, score=entry.score, matched_terms=())
+            )
+        return out
 
     async def get_section(self, section_id: str) -> tuple[Section, Document] | None:
         for section, document in pairs():

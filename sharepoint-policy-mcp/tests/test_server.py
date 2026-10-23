@@ -309,3 +309,44 @@ async def test_graph_mode_fails_loudly_rather_than_half_working(monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         srv.main()
     assert excinfo.value.code == 2
+
+
+# -- hybrid retrieval ----------------------------------------------------
+
+
+async def test_search_reports_which_retrieval_path_ran():
+    out = await call("sp_search_policy", {"query": "SAR filing deadline"})
+    assert out["retrieval"] == "lexical"
+
+
+async def test_hybrid_mode_is_reported_and_still_cites(monkeypatch):
+    monkeypatch.setenv("SP_RETRIEVAL", "hybrid")
+    srv.backend._settings = None
+    srv.backend._store = None
+
+    out = await call(
+        "sp_search_policy",
+        {"query": "how many calendar days to file a SAR after initial detection"},
+    )
+    assert out["retrieval"] == "hybrid"
+    top = out["results"][0]
+    assert top["section_id"] == DEADLINES
+    assert top["citation"]["version"] == "4.2"
+
+
+async def test_ping_in_hybrid_mode_warns_the_embedder_is_a_test_rig(monkeypatch):
+    monkeypatch.setenv("SP_RETRIEVAL", "hybrid")
+    srv.backend._settings = None
+    srv.backend._store = None
+    out = await call("sp_ping")
+    assert out["retrieval"] == "hybrid"
+    assert out["embedder_is_semantic"] is False
+
+
+async def test_an_unknown_retrieval_mode_fails_at_startup(monkeypatch):
+    monkeypatch.setenv("SP_RETRIEVAL", "telepathy")
+    srv.backend._settings = None
+    srv.backend._store = None
+    with pytest.raises(SystemExit) as excinfo:
+        srv.main()
+    assert excinfo.value.code == 2

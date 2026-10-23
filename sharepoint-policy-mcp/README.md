@@ -6,9 +6,10 @@ an MCP client (Claude Code, Claude Desktop, or anything else that speaks the pro
 retrieve the policy passage that answers a question, **with a citation**, instead of
 answering from the model's general knowledge of BSA requirements.
 
-This is step 1 of the AML case-management assistant: the retrieval layer, running against
-a synthetic corpus, with the guardrails already in place. The Graph-backed ingestion
-pipeline is step 3 — see [Roadmap](#roadmap).
+Steps 1 and 2 of the AML case-management assistant: the retrieval layer with its
+guardrails, and the ingestion pipeline that turns `.docx` policy into an index. The
+Graph-backed store that reaches a real SharePoint site is step 3 — see
+[Roadmap](#roadmap).
 
 Built against the Python SDK **`mcp` 2.x**, where the server class is `MCPServer`.
 Most tutorials online still show `FastMCP` from `mcp` 1.x — that import does not exist here.
@@ -33,7 +34,8 @@ issues you an app registration.
 
 ```bash
 uv venv .venv --python 3.13
-uv pip install --python .venv/bin/python "mcp>=2,<3" httpx pytest pytest-asyncio
+uv pip install --python .venv/bin/python \
+  "mcp>=2,<3" httpx numpy python-docx pytest pytest-asyncio
 
 SP_AUTH_MODE=mock .venv/bin/python -m sharepoint_policy_mcp.server
 ```
@@ -69,30 +71,101 @@ deadlines in it are the real ones — 30 and 60 days for a SAR, 120 for continui
 scaffolding for testing retrieval. It is not your institution's policy and it is not legal
 advice. `sp_ping` says so in its response, on purpose, so a model reading it knows too.
 
-## Retrieval, and what it cannot do yet
+## Ingestion
 
-Ranking is **BM25 over heading-boosted sections**. That is the lexical half of the hybrid
-retrieval the design calls for; the dense half arrives with the ingestion pipeline.
+Point the pipeline at a folder of `.docx` policies and it writes an index:
 
-Lexical-first is not an arbitrary choice. BSA language is formulaic and analysts quote it
-close to verbatim — *"continuing activity"*, *"within 30 calendar days"* — which is the
-case BM25 handles well and dense retrieval blurs. Three details carry most of the weight:
+```bash
+# Generate sample documents from the synthetic corpus, if you have no real ones
+.venv/bin/python tools/make_sample_docs.py sample-policies
 
-- **Heading boost.** Heading tokens are indexed three times. In a policy document a
-  heading is a strong signal: *"SAR Filing Deadlines"* beats a body paragraph that
-  mentions deadlines in passing.
+.venv/bin/python -m sharepoint_policy_mcp.ingest sample-policies -o index
+```
+
+Four stages — extract, chunk, embed, persist — and a manifest of content hashes, so a
+second run re-embeds only what changed.
+
+**Chunking is section-aware.** Word heading styles are the hierarchy, and in a policy
+document they are reliable in a way nothing else about the file is: the numbering scheme
+varies, the fonts vary, but somebody applied Heading 1 and Heading 2 because that is how
+the table of contents gets built. A section is kept whole when it fits and split on
+paragraph then sentence boundaries when it does not. Fixed-width windows cut straight
+through that, and the halves are worse than either the whole or a clean split — a window
+that ends mid-sentence retrieves on half a clause and cites a rule it does not contain.
+Every chunk carries its ancestry, so a clause split off the bottom of 5.1 still cites
+*5.1 SAR Filing Deadlines*.
+
+**Provenance is reported, never assumed.** A `.docx` cannot tell you which policy id it
+is, which version, who owns it, or who may read it. In production that comes from the
+SharePoint columns beside the file; here it comes from a `policies.json` sidecar, falling
+back to the filename, and every field that had to be guessed is listed in the run output:
+
+```
++ BSA-001 Program Policy v4.2.docx -> BSA-001 v4.2, 12 sections, 12 chunks
+    [inferred: library, effective_date, owner, url]
+```
+
+A citation whose version was inferred from a filename is a citation that can be wrong in
+the one field an examiner will check.
+
+PDF is deliberately not handled. Policy in a SharePoint library is nearly always the Word
+original and the PDF is a rendering of it, and PDF extraction has a much worse failure
+mode — silently reordered columns rather than a clean error.
+
+## Retrieval
+
+Two retrievers, fused by rank.
+
+**Lexical: BM25 over heading-boosted sections.** Not an arbitrary default. BSA language is
+formulaic and analysts quote it close to verbatim — *"continuing activity"*, *"within 30
+calendar days"* — which is the case BM25 handles well and dense retrieval blurs. Three
+details carry most of the weight:
+
+- **Heading boost.** Heading tokens are indexed three times. *"SAR Filing Deadlines"*
+  beats a body paragraph that mentions deadlines in passing.
 - **Query-side acronym expansion.** The corpus writes *"customer due diligence"*; the
   analyst types *"CDD"*. Expansion happens on the query only, so document statistics stay
-  untouched. Without it, the acronym query returns nothing — and in a compliance tool a
+  untouched. Without it the acronym query returns nothing — and in a compliance tool a
   miss does not read as a miss, it reads as *"the policy is silent"*.
 - **`314(a)` survives tokenisation** as `314a`. The difference between 314(a) and 314(b)
   is the difference between answering a law-enforcement request and sharing information
-  with another bank; collapsing both to `314` makes them indistinguishable.
+  with another bank.
 
-What it cannot do is match a question that shares no vocabulary with the answer. That is
-what the embeddings are for, and until they exist `sp_ping` reports
-`"retrieval": "lexical (BM25); vector half not yet built"` rather than letting a caller
-assume otherwise.
+**Dense: cosine over an embedding index**, persisted as a `.npz` and loaded with the
+embedder name it was built with. Vectors from two different models share a space only by
+coincidence; comparing them returns confident nonsense, which is the worst failure mode
+available to a retrieval system. A mismatch is refused rather than served.
+
+**Fusion: Reciprocal Rank Fusion, not score normalisation.** BM25 scores are unbounded and
+corpus-dependent; cosine sits in [-1, 1]. Any scheme that adds them has to invent a scale
+factor, and that factor silently becomes the most important tuning parameter in the
+system — one nobody set deliberately and nobody can explain to a reviewer. RRF uses only
+the ordering each retriever produced, which is the part each is actually good at.
+
+### `SP_RETRIEVAL` defaults to `lexical`, on purpose
+
+The only embedder in the tree is `HashingEmbedder`: a hashing vectoriser that buckets
+token hashes and normalises. It is deterministic, offline, and gives real
+lexical-overlap similarity — which is exactly why it must not be left on in hybrid mode
+and called retrieval. Fusing it with BM25 is a second opinion drawn from the same
+evidence. Paraphrase that shares no words with the policy scores **zero**, which is
+precisely the gap a real embedder exists to close.
+
+So it is a test rig: it exists so the chunking, indexing and fusion code has something
+deterministic to run against with no vendor, no key and no network. `sp_ping` reports
+`embedder_is_semantic: false` and the ingestion CLI prints a warning, so nobody mistakes
+the rig for retrieval quality. Set `SP_RETRIEVAL=hybrid` once a real embedder is wired in.
+
+Adding one is a single file implementing the three-member `Embedder` protocol
+(`name`, `dimensions`, `embed_documents` / `embed_query`). No provider is chosen yet —
+the live candidates are Azure OpenAI in your own tenant, a local open-weights model, and
+Voyage AI.
+
+### What is still missing
+
+A **reranker** — a cross-encoder over the fused top-N. It is the single biggest quality
+lever left, and it is deliberately not built: it needs the step-4 evaluation set to show
+it is earning its latency. Tuning it now would mean tuning against vibes.
 
 ## Guardrails, and why they are there
 
@@ -147,6 +220,8 @@ implied.
 | `SP_TENANT_ID` / `SP_CLIENT_ID` / `SP_CLIENT_SECRET` | — | Required for `graph` |
 | `SP_ALLOWED_LIBRARIES` | 3 policy libraries | Comma-separated allowlist |
 | `SP_USER_GROUPS` | `aml-analyst` | Caller's entitlement groups. A stopgap; see above. |
+| `SP_RETRIEVAL` | `lexical` | `lexical` or `hybrid`. See above for why it defaults low. |
+| `SP_EMBEDDING_DIMENSIONS` | `512` | Width of the offline test-rig embedder |
 | `SP_MAX_LIMIT` | `10` | Hard ceiling on passages per call |
 | `SP_DEFAULT_LIMIT` | `5` | Used when the caller omits `limit` |
 | `SP_MAX_PASSAGE_CHARS` | `1200` | Passage budget before clipping. Floor of 200. |
@@ -169,7 +244,9 @@ an unencrypted channel.
 .venv/bin/python -m pytest -q
 ```
 
-99 tests, no network and no credentials. They cover tokenisation and ranking, the
+187 tests, no network and no credentials. They cover tokenisation and ranking, chunk
+boundaries and budgets, extraction from real `.docx` files written by the tests
+themselves, provenance inference, delta sync, vector persistence, rank fusion, the
 entitlement and allowlist checks, passage clipping, redaction, and every tool end to end
 through the MCP dispatcher the way a client calls it.
 
@@ -183,13 +260,20 @@ fail.
 ```
 sharepoint_policy_mcp/
   config.py      Settings from env, site normalisation, allowlist, entitlement predicates
-  models.py      Document, Section, Hit -- citation fields live on the model itself
+  models.py      Document, Section, Chunk, Hit -- citations live on the model itself
   corpus.py      The synthetic policy corpus
+  extract.py     .docx -> a hierarchy of sections, via Word heading styles
+  chunking.py    Section-aware splitting with ancestry and overlap
+  embedder.py    Embedder protocol + HashingEmbedder (offline test rig)
+  vectors.py     On-disk cosine index, refuses a mismatched embedder
+  hybrid.py      Reciprocal rank fusion
+  ingest.py      The pipeline and its CLI, with content-hash delta sync
   search.py      BM25 with heading boost, policy-aware tokenisation, query expansion
   store.py       PolicyStore protocol, MockPolicyStore, entitlement trimming
   redaction.py   Value-pattern masking for passages
   server.py      MCPServer instance and the five tools
-tests/           99 tests across the modules above
+tools/           make_sample_docs.py -- writes the corpus out as .docx
+tests/           187 tests across the modules above
 ```
 
 ## Roadmap
@@ -197,9 +281,9 @@ tests/           99 tests across the modules above
 Where this sits in the larger build:
 
 1. **This server, mock-backed.** Done.
-2. **Ingestion pipeline.** Graph API → download → section-aware chunking (policy documents
-   are hierarchical; chunking on headings beats fixed windows) → embed → vector store,
-   with delta sync on `lastModifiedDateTime`.
+2. **Ingestion pipeline.** Done, for documents on disk: extract → section-aware chunking →
+   embed → persist, with delta sync on content hash. Still to come: a real embedder, and
+   fetching the documents from Graph rather than a folder.
 3. **Graph-backed store.** Entra ID app registration with `Sites.Selected`, scoped to the
    policy site. Per-user entitlement trimming against real ACLs, replacing
    `SP_USER_GROUPS`. `SP_AUTH_MODE=graph` exits with a clear message until this lands,

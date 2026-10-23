@@ -63,3 +63,44 @@ class Hit:
     document: Document
     score: float
     matched_terms: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """A retrievable unit: a section, or one piece of a section too long to embed.
+
+    A chunk carries its ancestry. A clause split off the bottom of
+    "5.1 SAR Filing Deadlines" must still cite that heading, or the analyst gets
+    a deadline with nothing saying which deadline it is.
+    """
+
+    chunk_id: str  # "BSA-001@4.2#5.1/1"
+    section_id: str
+    policy_id: str
+    version: str
+    number: str
+    heading: str
+    heading_path: tuple[str, ...]  # document title down to this section
+    text: str
+    ordinal: int  # 0-based position within the section
+    total: int  # how many chunks the section produced
+    audience: tuple[str, ...] = ()
+
+    @property
+    def is_partial(self) -> bool:
+        return self.total > 1
+
+    def as_section(self) -> Section:
+        """View this chunk as a Section, for the lexical index.
+
+        The heading carries the ancestry so that heading-boosted scoring sees
+        the parent terms too -- a chunk of 5.1 should still match "SAR".
+        """
+        return Section(
+            section_id=self.chunk_id,
+            policy_id=self.policy_id,
+            number=self.number,
+            heading=" ".join(self.heading_path),
+            text=self.text,
+            audience=self.audience,
+        )

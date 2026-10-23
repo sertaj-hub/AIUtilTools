@@ -160,3 +160,76 @@ async def test_readable_results_backfill_the_page_when_sections_are_withheld():
     assert analyst[-1].section.section_id not in {
         h.section.section_id for h in manager
     }
+
+
+# -- hybrid retrieval ----------------------------------------------------
+
+
+async def test_lexical_is_still_the_default():
+    assert store()._settings.is_hybrid is False
+    out = await store().ping()
+    assert out["retrieval"] == "lexical"
+    assert "SP_RETRIEVAL=hybrid" in out["retrieval_detail"]
+
+
+async def test_ping_declares_the_embedder_is_not_semantic():
+    out = await store(retrieval="hybrid").ping()
+    assert out["retrieval"] == "hybrid"
+    assert out["embedder"].startswith("hashing-")
+    assert out["embedder_is_semantic"] is False
+
+
+async def test_hybrid_still_ranks_the_right_section_first():
+    hits, _ = await store(retrieval="hybrid").search(
+        "how many days to file a SAR after initial detection", None, None, False, 3
+    )
+    assert hits[0].section.section_id == "BSA-001@4.2#5.1"
+
+
+async def test_hybrid_respects_the_hard_filters():
+    hits, _ = await store(retrieval="hybrid").search("quality", "QA", None, False, 10)
+    assert hits
+    assert {h.document.doc_type for h in hits} == {"QA"}
+
+
+async def test_hybrid_excludes_superseded_versions_by_default():
+    hits, _ = await store(retrieval="hybrid").search(
+        "SAR filing deadline", None, None, False, 10
+    )
+    assert all(not h.document.superseded for h in hits)
+
+
+async def test_hybrid_still_withholds_restricted_sections():
+    hits, withheld = await store(retrieval="hybrid").search(
+        "law enforcement contact about a filed report", None, None, False, 3
+    )
+    assert withheld > 0
+    assert all(h.document.policy_id != "QC-022" for h in hits)
+
+
+async def test_hybrid_is_deterministic():
+    first, _ = await store(retrieval="hybrid").search("training", None, None, False, 5)
+    second, _ = await store(retrieval="hybrid").search("training", None, None, False, 5)
+    assert [h.section.section_id for h in first] == [
+        h.section.section_id for h in second
+    ]
+
+
+async def test_hybrid_scores_are_fusion_scores_not_bm25_scores():
+    # RRF scores are small reciprocals; BM25 scores on this corpus are >1.
+    # Seeing a BM25 score here would mean the fusion step was skipped.
+    hits, _ = await store(retrieval="hybrid").search(
+        "suspicious activity report", None, None, False, 3
+    )
+    assert hits
+    assert all(0 < h.score < 1 for h in hits)
+
+
+async def test_the_vector_index_is_built_once_and_reused():
+    st = store(retrieval="hybrid")
+    assert st._vectors is None  # nothing embedded at construction
+    await st.search("training", None, None, False, 3)
+    first = st._vectors
+    assert first is not None
+    await st.search("filing", None, None, False, 3)
+    assert st._vectors is first
